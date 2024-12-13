@@ -67,17 +67,29 @@ class ModelObserver(BaseObserver):
         post_save.connect(
             self.post_save_receiver, sender=self.model_cls, dispatch_uid=str(id(self))
         )
-
+        have_m2m = False
         for field in self.model_cls._meta.many_to_many:
             m2m_changed.connect(
                 self.m2m_changed_receiver,
                 sender=field.remote_field.through,
                 dispatch_uid=f"{id(self)}-{field.name}"
             )
+            have_m2m = True
 
         post_delete.connect(
             self.post_delete_receiver, sender=self.model_cls, dispatch_uid=str(id(self))
         )
+
+        if have_m2m:
+            warnings.warn(
+                "Model observation with many-to-many fields is partially supported. " +
+                "If you delete a related object, the signal will not be sent. " +
+                "This is a Django bug that is over 10 years old: https://code.djangoproject.com/ticket/17688. " +
+                "Also, when working with many-to-many fields, Django uses savepoints, " +
+                "working with which is non-deterministic and can lead to unexpected results, " +
+                "as we do not support them.",
+                UnsupportedWarning,
+            )
 
     def post_init_receiver(self, instance: Model, **kwargs):
 
@@ -106,11 +118,12 @@ class ModelObserver(BaseObserver):
         else:
             self.database_event(instance, Action.UPDATE)
 
-    def m2m_changed_receiver(self, action: str, instance: Model, reverse: bool, model: Type[Model], pk_set: Set[Any], **kwargs):
+    def m2m_changed_receiver(self, action: str, instance: Model, reverse: bool, model: Type[Model], pk_set: Set[Any],
+                             **kwargs):
         """
         Handle many-to-many changes.
         """
-        if action not in {"post_add",  "post_remove", "post_clear"}:
+        if action not in {"post_add", "post_remove", "post_clear"}:
             return
 
         target_instances = []
@@ -162,7 +175,8 @@ class ModelObserver(BaseObserver):
 
         yield from self.generate_messages(instance, old_group_names, new_group_names, action, **kwargs)
 
-    def generate_messages(self, instance: Model, old_group_names: Set[str], new_group_names: Set[str], action: Action, **kwargs):
+    def generate_messages(self, instance: Model, old_group_names: Set[str], new_group_names: Set[str], action: Action,
+                          **kwargs):
         """
         Generates messages for the given group names and action.
         """
