@@ -10,7 +10,7 @@ from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from django.db import transaction
 from django.db.models import Model
-from django.db.models.signals import post_delete, post_save, post_init
+from django.db.models.signals import post_delete, post_save, post_init, m2m_changed
 from rest_framework.serializers import Serializer
 
 from djangochannelsrestframework.observer.base_observer import BaseObserver
@@ -61,16 +61,36 @@ class ModelObserver(BaseObserver):
 
         # this is used to capture the current state for the model
         post_init.connect(
-            self.post_init_receiver, sender=self.model_cls, dispatch_uid=id(self)
+            self.post_init_receiver, sender=self.model_cls, dispatch_uid=str(id(self))
         )
 
         post_save.connect(
-            self.post_save_receiver, sender=self.model_cls, dispatch_uid=id(self)
+            self.post_save_receiver, sender=self.model_cls, dispatch_uid=str(id(self))
         )
+        have_m2m = False
+        for field in self.model_cls._meta.many_to_many:
+            if hasattr(field.remote_field, 'through'):
+                m2m_changed.connect(
+                    self.m2m_changed_receiver,
+                    sender=field.remote_field.through,
+                    dispatch_uid=f"{str(id(self))}-{self.model_cls.__name__}-{field.name}"
+                )
+                have_m2m = True
 
         post_delete.connect(
-            self.post_delete_receiver, sender=self.model_cls, dispatch_uid=id(self)
+            self.post_delete_receiver, sender=self.model_cls, dispatch_uid=str(id(self))
         )
+
+        if have_m2m:
+            warnings.warn(
+                "Model observation with many-to-many fields is partially supported. " +
+                "If you delete a related object, the signal will not be sent. " +
+                "This is a Django bug that is over 10 years old: https://code.djangoproject.com/ticket/17688. " +
+                "Also, when working with many-to-many fields, Django uses savepoints, " +
+                "working with which is non-deterministic and can lead to unexpected results, " +
+                "as we do not support them.",
+                UnsupportedWarning,
+            )
 
     def post_init_receiver(self, instance: Model, **kwargs):
 
@@ -99,10 +119,47 @@ class ModelObserver(BaseObserver):
         else:
             self.database_event(instance, Action.UPDATE)
 
+    def m2m_changed_receiver(self, sender, instance: Model, action: str, reverse: bool, model: Type[Model],
+                             pk_set: Set[Any], **kwargs):
+        """
+        Handle many-to-many changes.
+        """
+        if action not in {"post_add", "post_remove", "post_clear"} and not reverse:
+            return
+
+        if action not in {"post_add", "post_remove", "pre_clear"} and reverse:
+            return
+
+        target_instances = []
+        if not reverse:
+            target_instances.append(instance)
+        else:
+            if pk_set:
+                for pk in pk_set:
+                    target_instances.append(model.objects.get(pk=pk))
+            else:  # pre_clear case
+                related_field = next(
+                    (field for field in instance._meta.get_fields()
+                     if field.many_to_many and hasattr(field, 'through') and field.through == sender),
+                    None
+                )
+                if related_field:
+                    related_manager = getattr(instance, related_field.related_name or f"{related_field.name}_set", None)
+                    if related_manager:
+                        target_instances.extend(related_manager.all())
+        
+        target_instances = list(set(target_instances))  # remove duplicates if any
+        for target_instance in target_instances:
+            self.database_event(target_instance, Action.UPDATE)
+
     def post_delete_receiver(self, instance: Model, **kwargs):
         self.database_event(instance, Action.DELETE)
 
     def database_event(self, instance: Model, action: Action):
+        """
+        Handles database events and prepares messages for sending on commit.
+        """
+        messages = list(self.prepare_messages(instance, action))
 
         connection = transaction.get_connection()
 
@@ -110,17 +167,16 @@ class ModelObserver(BaseObserver):
             if len(connection.savepoint_ids) > 0:
                 warnings.warn(
                     "Model observation with save points is unsupported and will"
-                    " result in unexpected beauvoir.",
+                    " result in unexpected behavior.",
                     UnsupportedWarning,
                 )
 
-        connection.on_commit(partial(self.post_change_receiver, instance, action))
+        connection.on_commit(partial(self.send_prepared_messages, messages))
 
-    def post_change_receiver(self, instance: Model, action: Action, **kwargs):
+    def prepare_messages(self, instance: Model, action: Action, **kwargs):
         """
-        Triggers the old_binding to possibly send to its group.
+        Prepares messages for sending based on the given action and instance.
         """
-
         if action == Action.CREATE:
             old_group_names = set()
         else:
@@ -133,37 +189,32 @@ class ModelObserver(BaseObserver):
 
         self.get_observer_state(instance).current_groups = new_group_names
 
-        # if post delete, new_group_names should be []
+        yield from self.generate_messages(instance, old_group_names, new_group_names, action, **kwargs)
 
-        # Django DDP had used the ordering of DELETE, UPDATE then CREATE for good reasons.
-        self.send_messages(
-            instance, old_group_names - new_group_names, Action.DELETE, **kwargs
-        )
-        # the object has been updated so that its groups are not the same.
-        self.send_messages(
-            instance, old_group_names & new_group_names, Action.UPDATE, **kwargs
-        )
+    def generate_messages(self, instance: Model, old_group_names: Set[str], new_group_names: Set[str], action: Action,
+                          **kwargs):
+        """
+        Generates messages for the given group names and action.
+        """
+        for group_name in old_group_names - new_group_names:
+            yield {**self.serialize(instance, Action.DELETE, **kwargs), "group": group_name}
 
-        #
-        self.send_messages(
-            instance, new_group_names - old_group_names, Action.CREATE, **kwargs
-        )
+        for group_name in old_group_names & new_group_names:
+            yield {**self.serialize(instance, Action.UPDATE, **kwargs), "group": group_name}
 
-    def send_messages(
-        self, instance: Model, group_names: Set[str], action: Action, **kwargs
-    ):
-        if not group_names:
+        for group_name in new_group_names - old_group_names:
+            yield {**self.serialize(instance, Action.CREATE, **kwargs), "group": group_name}
+
+    def send_prepared_messages(self, messages):
+        """
+        Sends prepared messages to the channel layer.
+        """
+        if not messages:
             return
-        message = self.serialize(instance, action, **kwargs)
+
         channel_layer = get_channel_layer()
-
-        for group_name in group_names:
-            message_to_send = deepcopy(message)
-
-            # Include the group name in the message being sent
-            message_to_send["group"] = group_name
-
-            async_to_sync(channel_layer.group_send)(group_name, message_to_send)
+        for message in messages:
+            async_to_sync(channel_layer.group_send)(message["group"], deepcopy(message))
 
     def group_names(self, *args, **kwargs):
         # one channel for all updates.
